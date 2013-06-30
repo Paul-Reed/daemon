@@ -669,6 +669,8 @@ I<kill(2)>
 #include <sys/stat.h>
 #include <sys/select.h>
 
+#include <time.h>
+
 #include <slack/prog.h>
 #include <slack/daemon.h>
 #include <slack/coproc.h>
@@ -679,6 +681,10 @@ I<kill(2)>
 #include <slack/list.h>
 #include <slack/str.h>
 #include <slack/fio.h>
+
+// jwa
+#define MAXPATHLEN 1024
+#define LOG_FTIME "%Y-%m-%dT%H:%M"
 
 /* Configuration file entries */
 
@@ -738,6 +744,8 @@ struct Config
 #define CONFIG_PATH_USER ".daemonrc"
 #endif
 
+#define TIMESTAMP_LEN 32
+
 /* Global variables */
 
 extern char **environ;
@@ -785,6 +793,8 @@ static struct
 	char *daemon_dbg;  /* syslog/file spec for daemon debug output */
 	int client_outlog; /* syslog facility for client stdout */
 	int client_errlog; /* syslog facility for client stderr */
+	char *client_out_log_stamp; /* XXX */
+	char *client_err_log_stamp; /* XXX */
 	int daemon_errlog; /* syslog facility for daemon output */
 	int daemon_dbglog; /* syslog facility for daemon debug output */
 	int client_outfd;  /* file descriptor for client stdout */
@@ -811,6 +821,7 @@ static struct
 	int stdin_isatty;             /* is stdin a terminal? */
 	int stdin_eof;                /* has stdin received eof? */
 	int terminated;               /* have we received a term signal? */
+	int rotate_logs;    /* whether or not to rotate logs */
 }
 g =
 {
@@ -855,6 +866,8 @@ g =
 	null,                   /* daemon_dbg */
 	0,                      /* client_outlog */
 	0,                      /* client_errlog */
+	null,                   /* client_out_foo XXX */
+	null,                   /* client_err_foo XXX */
 	LOG_DAEMON | LOG_ERR,   /* daemon_errlog */
 	LOG_DAEMON | LOG_DEBUG, /* daemon_dbglog */
 	-1,                     /* client_outfd */
@@ -880,8 +893,13 @@ g =
 	{ 0 },                  /* stdin_winsize */
 	0,                      /* stdin_isatty */
 	0,                      /* stdin_eof */
-	0                       /* terminated */
+	0,                      /* terminated */
+	0                       /* rotate_logs */
 };
+
+
+void write_client_out(char *buf, int n);
+void get_datestamp(char *ftime, char *fmt);
 
 /*
 
@@ -1488,6 +1506,10 @@ static Option daemon_optab[] =
 	{
 		"stop", nul, null, "Terminate a named daemon process",
 		no_argument, OPT_NONE, OPT_VARIABLE, &g.stop, null
+	},
+	{
+		"rotate-logs", nul, null, "rotate logs based on timestamp",
+		no_argument, OPT_NONE, OPT_VARIABLE, &g.rotate_logs, null
 	},
 	{
 		null, '\0', null, null, 0, 0, 0, null, null
@@ -2387,8 +2409,8 @@ static void run(void)
 					{
 						debug((2, "writing client stdout (fd %d, %d bytes)", g.client_outfd, n))
 
-						if (write(g.client_outfd, buf, n) == -1)
-							errorsys("failed to write(client_outfd = %d)", g.client_outfd);
+						write_client_out(buf, n);
+
 					}
 
 					if (g.client_outlog)
@@ -2509,8 +2531,10 @@ static void run(void)
 					{
 						debug((2, "writing client stdout/stderr (fd %d, %d bytes)", g.client_outfd, n))
 
-						if (write(g.client_outfd, buf, n) == -1)
+						write_client_out(buf, n);
+						/* if (write(g.client_outfd, buf, n) == -1)
 							errorsys("failed to write(client_outfd = %d)", g.client_outfd);
+							*/
 					}
 
 					if (g.client_outlog)
@@ -3257,6 +3281,19 @@ static void init(int ac, char **av)
 			fatalsys("failed to start debug delivery to %s", g.daemon_dbg);
 	}
 
+	/* malloc logrotate log_stamp buffers */
+
+	if (g.rotate_logs)
+	{
+		if (!(g.client_out_log_stamp = mem_create(TIMESTAMP_LEN, char *)))
+			fatalsys("out of memory");
+		if (!(g.client_err_log_stamp = mem_create(TIMESTAMP_LEN, char *)))
+			fatalsys("out of memory");
+
+		get_datestamp(g.client_out_log_stamp, LOG_FTIME);
+		get_datestamp(g.client_err_log_stamp, LOG_FTIME);
+	}
+
 	/* Set client's stdout and stderr destinations (syslog or file) */
 
 	flags = O_CREAT | O_WRONLY | O_APPEND;
@@ -3277,6 +3314,7 @@ static void init(int ac, char **av)
 		if ((g.client_errfd = open(g.client_err, flags, mode)) == -1)
 			errorsys("failed to open %s to log client stderr", g.client_err);
 	}
+
 
 	/* Build an environment variable vector for the client */
 
@@ -3304,4 +3342,81 @@ int main(int ac, char **av)
 	return EXIT_SUCCESS; /* unreached */
 }
 
-/* vi:set ts=4 sw=4: */
+
+void write_client_out(char *buf, int n)
+{
+	debug((2, "write_client_out()"));
+	char header[32];
+
+ 	if (g.rotate_logs)
+	{
+		int flags;
+		int mode;
+		char current_timestamp[TIMESTAMP_LEN];
+		char archive_log_path[MAXPATHLEN];
+
+		get_datestamp(current_timestamp, LOG_FTIME);
+
+		if (strcmp(g.client_out_log_stamp, current_timestamp))
+		{
+			debug((2, "timestamps differ; rotating client output file: %s", g.client_out));
+			close(g.client_outfd);
+		
+			// build path to archive file & rename it
+			strlcpy(archive_log_path, g.client_out, MAXPATHLEN);
+			strlcat(archive_log_path, ".", MAXPATHLEN);
+			strlcat(archive_log_path, current_timestamp, MAXPATHLEN);
+
+			if (rename(g.client_out, archive_log_path) == -1)
+				errorsys("error during rename to %s", archive_log_path);
+
+			// update state
+			strcpy(g.client_out_log_stamp, current_timestamp);
+
+			// re-open "new" log file
+			
+			flags = O_CREAT | O_WRONLY | O_APPEND;
+			mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
+
+			if ((g.client_outfd = open(g.client_out, flags, mode)) == -1)
+				errorsys("failed to open %s to log client stdout", g.client_out);
+		}
+		else
+		{
+			debug((2, "no rotation required"));
+		}
+	}
+
+	debug((2, "about to write %d", n));
+
+/* doesn't work yet; not line buffered. will need to split buf on \n 
+   THAT'S ONLY 40 LINES OF CODE !@# YAY STRTOK!@@@
+
+	get_datestamp(header, "%Y-%m-%d %H:%M:%S %Z ");
+	write(g.client_outfd, header, strlen(header));
+*/
+
+	if (write(g.client_outfd, buf, n) == -1)
+		errorsys("failed to write(client_outfd = %d)", g.client_outfd);
+
+	debug((2, "leaving write_client_out()"));
+
+}
+
+void get_log_pathname(char *out_path)
+{
+	
+	debug((2, "get_log_pathname() returning %s", out_path));
+	return;
+}
+
+void get_datestamp(char *ftime, char *fmt)
+{
+	time_t now;
+	int sz;
+
+	time(&now);
+	sz = strftime(ftime, TIMESTAMP_LEN-1, fmt, localtime(&now));
+}
+
+/* vi:set noet ai ts=4 sw=4: */
