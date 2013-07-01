@@ -682,9 +682,12 @@ I<kill(2)>
 #include <slack/str.h>
 #include <slack/fio.h>
 
-// jwa
-#define MAXPATHLEN 1024
-#define LOG_FTIME "%Y-%m-%dT%H:%M"
+/* jwa */
+#define MAXPATHLEN 1024 /* XXX should already be defined */
+#define FMT_LEN    32
+
+void write_wrapper(char *buf, int n, char *log_path, char *log_stamp, int *log_fd);
+void ez_strftime(char *ftime, char *fmt);
 
 /* Configuration file entries */
 
@@ -743,8 +746,6 @@ struct Config
 #ifndef CONFIG_PATH_USER
 #define CONFIG_PATH_USER ".daemonrc"
 #endif
-
-#define TIMESTAMP_LEN 32
 
 /* Global variables */
 
@@ -822,6 +823,7 @@ static struct
 	int stdin_eof;                /* has stdin received eof? */
 	int terminated;               /* have we received a term signal? */
 	int rotate_logs;    /* whether or not to rotate logs */
+	char *rotated_log_fmt; /* passed to strftime */
 }
 g =
 {
@@ -894,12 +896,10 @@ g =
 	0,                      /* stdin_isatty */
 	0,                      /* stdin_eof */
 	0,                      /* terminated */
-	0                       /* rotate_logs */
+	0,                      /* rotate_logs */
+	"%Y-%m-%d"              /* rotated_log_fmt */
 };
 
-
-void write_client_out(char *buf, int n);
-void get_datestamp(char *ftime, char *fmt);
 
 /*
 
@@ -1510,6 +1510,10 @@ static Option daemon_optab[] =
 	{
 		"rotate-logs", nul, null, "rotate logs based on timestamp",
 		no_argument, OPT_NONE, OPT_VARIABLE, &g.rotate_logs, null
+	},
+	{
+		"rotated-log-fmt", nul, null, "time format appended to logfile (default %Y-%m-%d)",
+		required_argument, OPT_STRING, OPT_VARIABLE, &g.rotated_log_fmt, null
 	},
 	{
 		null, '\0', null, null, 0, 0, 0, null, null
@@ -2409,7 +2413,7 @@ static void run(void)
 					{
 						debug((2, "writing client stdout (fd %d, %d bytes)", g.client_outfd, n))
 
-						write_client_out(buf, n);
+						write_wrapper(buf, n, g.client_out, g.client_out_log_stamp, &g.client_outfd);
 
 					}
 
@@ -2470,8 +2474,11 @@ static void run(void)
 					{
 						debug((2, "writing client stderr (fd %d, %d bytes)", g.client_errfd, n))
 
+						write_wrapper(buf, n, g.client_err, g.client_err_log_stamp, &g.client_errfd);
+						/*
 						if (write(g.client_errfd, buf, n) == -1)
 							errorsys("failed to write(client_errfd = %d)", g.client_errfd);
+						*/
 					}
 
 					if (g.client_errlog)
@@ -2530,11 +2537,7 @@ static void run(void)
 					if (g.client_outfd != -1)
 					{
 						debug((2, "writing client stdout/stderr (fd %d, %d bytes)", g.client_outfd, n))
-
-						write_client_out(buf, n);
-						/* if (write(g.client_outfd, buf, n) == -1)
-							errorsys("failed to write(client_outfd = %d)", g.client_outfd);
-							*/
+						write_wrapper(buf, n, g.client_out, g.client_out_log_stamp, &g.client_outfd);
 					}
 
 					if (g.client_outlog)
@@ -3285,13 +3288,13 @@ static void init(int ac, char **av)
 
 	if (g.rotate_logs)
 	{
-		if (!(g.client_out_log_stamp = mem_create(TIMESTAMP_LEN, char *)))
+		if (!(g.client_out_log_stamp = mem_create(FMT_LEN, char *)))
 			fatalsys("out of memory");
-		if (!(g.client_err_log_stamp = mem_create(TIMESTAMP_LEN, char *)))
+		if (!(g.client_err_log_stamp = mem_create(FMT_LEN, char *)))
 			fatalsys("out of memory");
 
-		get_datestamp(g.client_out_log_stamp, LOG_FTIME);
-		get_datestamp(g.client_err_log_stamp, LOG_FTIME);
+		ez_strftime(g.client_out_log_stamp, g.rotated_log_fmt);
+		ez_strftime(g.client_err_log_stamp, g.rotated_log_fmt);
 	}
 
 	/* Set client's stdout and stderr destinations (syslog or file) */
@@ -3342,81 +3345,88 @@ int main(int ac, char **av)
 	return EXIT_SUCCESS; /* unreached */
 }
 
+/*
 
-void write_client_out(char *buf, int n)
+C<void write_wrapper(char *buf, int n, char *log_path, char *log_stamp, int *log_fd)>
+
+Write C<n> bytes of C<buf> to C<log_fd>.  
+
+C<log_stamp> is a pointer to either g.client_out_log_stamp
+or g.error_out_log_stamp, and C<log_fd> is a pointer to either
+g.client_out or g.error_out.
+
+If log rotation is enabled, and if log_stamp differs from 
+the current date, then C<log_fd> is closed, C<log_path> is rotated and re-opened.
+
+TODO: delete old logs, prefix each log entry with a timestamp.
+
+*/
+
+void write_wrapper(char *buf, int n, char *log_path, char *log_stamp, int *log_fd)
 {
-	debug((2, "write_client_out()"));
-	char header[32];
+	debug((2, "write_wrapper() log_path=%s",  log_path));
+	debug((2, "write_wrapper() log_stamp=%s", log_stamp));
+	debug((2, "write_wrapper() log_fd=%d",    *log_fd));
+	debug((2, "write_wrapper() fmt=%s",       g.rotated_log_fmt));
 
  	if (g.rotate_logs)
 	{
 		int flags;
 		int mode;
-		char current_timestamp[TIMESTAMP_LEN];
+		char current_timestamp[FMT_LEN];
 		char archive_log_path[MAXPATHLEN];
 
-		get_datestamp(current_timestamp, LOG_FTIME);
+		ez_strftime(current_timestamp, g.rotated_log_fmt);
 
-		if (strcmp(g.client_out_log_stamp, current_timestamp))
+		if (strcmp(log_stamp, current_timestamp))
 		{
-			debug((2, "timestamps differ; rotating client output file: %s", g.client_out));
-			close(g.client_outfd);
+			debug((2, "timestamps differ; rotating client output file: %s", log_path));
+			close(*log_fd);
 		
-			// build path to archive file & rename it
-			strlcpy(archive_log_path, g.client_out, MAXPATHLEN);
+			/* build path to archive file & rename it */
+			strlcpy(archive_log_path, log_path, MAXPATHLEN);
 			strlcat(archive_log_path, ".", MAXPATHLEN);
 			strlcat(archive_log_path, current_timestamp, MAXPATHLEN);
 
-			if (rename(g.client_out, archive_log_path) == -1)
+			if (rename(log_path, archive_log_path) == -1)
 				errorsys("error during rename to %s", archive_log_path);
 
-			// update state
-			strcpy(g.client_out_log_stamp, current_timestamp);
+			/* update state */
+			strlcpy(log_stamp, current_timestamp, FMT_LEN);
 
-			// re-open "new" log file
+			/* re-open "new" log file */
 			
 			flags = O_CREAT | O_WRONLY | O_APPEND;
 			mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
 
-			if ((g.client_outfd = open(g.client_out, flags, mode)) == -1)
-				errorsys("failed to open %s to log client stdout", g.client_out);
+			if ((*log_fd = open(log_path, flags, mode)) == -1)
+				errorsys("failed to open log %s", log_path);
 		}
-		else
-		{
-			debug((2, "no rotation required"));
-		}
+		/* else, no rotation required */
 	}
-
-	debug((2, "about to write %d", n));
 
 /* doesn't work yet; not line buffered. will need to split buf on \n 
    THAT'S ONLY 40 LINES OF CODE !@# YAY STRTOK!@@@
 
-	get_datestamp(header, "%Y-%m-%d %H:%M:%S %Z ");
+	char header[32];
+	ez_strftime(header, "%Y-%m-%d %H:%M:%S %Z ");
 	write(g.client_outfd, header, strlen(header));
 */
 
-	if (write(g.client_outfd, buf, n) == -1)
-		errorsys("failed to write(client_outfd = %d)", g.client_outfd);
+	if (write(*log_fd, buf, n) == -1)
+		errorsys("failed to write(log_outfd = %d)", *log_fd);
 
-	debug((2, "leaving write_client_out()"));
+	debug((2, "leaving write_wrapper()"));
 
 }
 
-void get_log_pathname(char *out_path)
-{
-	
-	debug((2, "get_log_pathname() returning %s", out_path));
-	return;
-}
-
-void get_datestamp(char *ftime, char *fmt)
+void ez_strftime(char *ftime, char *fmt) /* could this be a macro? */
 {
 	time_t now;
 	int sz;
 
 	time(&now);
-	sz = strftime(ftime, TIMESTAMP_LEN-1, fmt, localtime(&now));
+	sz = strftime(ftime, FMT_LEN-1, fmt, localtime(&now));
 }
 
 /* vi:set noet ai ts=4 sw=4: */
